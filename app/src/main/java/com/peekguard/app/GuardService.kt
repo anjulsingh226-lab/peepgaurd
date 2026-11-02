@@ -15,13 +15,13 @@ import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
-import android.provider.Settings
 import android.util.Size
 import android.view.Gravity
 import android.view.View
@@ -50,7 +50,11 @@ import kotlin.math.abs
  * Foreground service:
  *  - har 1 second me dekhta hai kaun sa app screen par hai (UsageStats)
  *  - agar wo app "protected" list me hai -> front camera ON + face detection
- *  - 2 ya zyada log screen ki taraf dekh rahe hon -> popup (Ignore / Friend)
+ *    (protected app screen par hone tak camera hamesha chalu rehti hai)
+ *  - 2 ya zyada log screen ki taraf dekh rahe hon -> screen dim + popup
+ *    (Friend / Ignore), fir timer list (30s, 1, 2, 5, 10 minute)
+ *  - jab tak user in dono me se koi time nahi chunta, popup khud band nahi
+ *    hota aur scanning chalti rehti hai
  * Koi photo save nahi hoti, kuch internet par nahi jata.
  */
 class GuardService : LifecycleService() {
@@ -68,7 +72,19 @@ class GuardService : LifecycleService() {
     private var snoozeUntil = 0L
     private var curFg: String? = null
     private var lastQuery = 0L
-    private var overlay: View? = null
+
+    // overlay state
+    private var dimView: View? = null
+    private var cardView: LinearLayout? = null
+    private var pendingWho: String? = null // null = "ask" step abhi dikh raha hai, warna "Friend"/"Ignore"
+
+    private val TIMER_OPTIONS = listOf(
+        "30 second" to 30_000L,
+        "1 minute" to 60_000L,
+        "2 minute" to 120_000L,
+        "5 minute" to 300_000L,
+        "10 minute" to 600_000L
+    )
 
     private val tick = object : Runnable {
         override fun run() {
@@ -124,13 +140,13 @@ class GuardService : LifecycleService() {
 
     // ---------- main loop ----------
     private fun loop() {
-        val now = System.currentTimeMillis()
         scanEvents(lastQuery)
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         val apps = prefs.getStringSet("apps", emptySet()) ?: emptySet()
-        val friend = now < prefs.getLong("friendUntil", 0L)
         val fg = curFg
-        val want = pm.isInteractive && fg != null && apps.contains(fg) && !friend
+        // Protected app screen par hai to camera hamesha ON rahegi — snooze sirf
+        // naya popup dikhne se rokta hai, camera/scanning ko band nahi karta.
+        val want = pm.isInteractive && fg != null && apps.contains(fg)
         if (want) {
             if (!cameraOn && SystemClock.elapsedRealtime() - lastCamTry > 3000) startCamera()
         } else {
@@ -211,95 +227,174 @@ class GuardService : LifecycleService() {
         // sirf wo chehre gino jo screen ki taraf dekh rahe hain
         val looking = faces.count { abs(it.headEulerAngleY) < 45f && abs(it.headEulerAngleX) < 40f }
         hits = if (looking >= 2) hits + 1 else maxOf(0, hits - 1)
-        if (hits >= 3 && overlay == null && System.currentTimeMillis() > snoozeUntil) {
+        if (hits >= 3 && cardView == null && System.currentTimeMillis() > snoozeUntil) {
             hits = 0
-            showOverlay()
+            showAskOverlay()
         }
     }
 
-    // ---------- popup ----------
-    private fun showOverlay() {
-        if (!Settings.canDrawOverlays(this)) return
-        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val d = resources.displayMetrics.density
-        fun dp(v: Int) = (v * d).toInt()
-
-        val box = LinearLayout(this)
-        box.orientation = LinearLayout.VERTICAL
-        box.setPadding(dp(18), dp(16), dp(18), dp(16))
-        val bg = GradientDrawable()
-        bg.setColor(Color.parseColor("#F2B3001B"))
-        bg.cornerRadius = dp(18).toFloat()
-        box.background = bg
-
-        val title = TextView(this)
-        title.text = "\u26A0 Third person detected!"
-        title.setTextColor(Color.WHITE)
-        title.textSize = 20f
-        title.setTypeface(title.typeface, android.graphics.Typeface.BOLD)
-        box.addView(title)
-
-        val msg = TextView(this)
-        msg.text = "Koi aur aapki screen dekh raha hai."
-        msg.setTextColor(Color.WHITE)
-        msg.textSize = 14f
-        msg.setPadding(0, dp(6), 0, dp(12))
-        box.addView(msg)
-
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-
-        val ignore = Button(this)
-        ignore.text = "Ignore"
-        ignore.setOnClickListener {
-            snoozeUntil = System.currentTimeMillis() + 2 * 60_000L
-            removeOverlay()
-        }
-        val friend = Button(this)
-        friend.text = "Friend"
-        friend.setOnClickListener {
-            prefs.edit().putLong("friendUntil", System.currentTimeMillis() + 30 * 60_000L).apply()
-            Toast.makeText(applicationContext, "Friend mode ON: 30 minute", Toast.LENGTH_SHORT).show()
-            removeOverlay()
-        }
-        val lpBtn = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        lpBtn.setMargins(dp(4), 0, dp(4), 0)
-        row.addView(ignore, lpBtn)
-        row.addView(friend, lpBtn)
-        box.addView(row)
-
-        val lp = WindowManager.LayoutParams(
-            (resources.displayMetrics.widthPixels * 0.92f).toInt(),
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT
-        )
-        lp.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-        lp.y = dp(70)
-
-        try {
-            wm.addView(box, lp)
-            overlay = box
-        } catch (e: Exception) {
-            return
+    // ---------- popup: step 1 (Friend / Ignore) ----------
+    private fun showAskOverlay() {
+        pendingWho = null
+        showDim()
+        renderCard {
+            title("\u26A0 Third person detected!")
+            message("Screen dim kar di gayi hai. Ye kaun hai?")
+            twoButtons(
+                "Ignore", { showTimerOverlay("Ignore") },
+                "Friend", { showTimerOverlay("Friend") }
+            )
         }
         vibrate()
-        handler.postDelayed({
-            if (overlay === box) {
-                snoozeUntil = System.currentTimeMillis() + 30_000L
-                removeOverlay()
-            }
-        }, 15_000L)
     }
 
-    private fun removeOverlay() {
-        val v = overlay ?: return
-        overlay = null
+    // ---------- popup: step 2 (timer list) ----------
+    private fun showTimerOverlay(who: String) {
+        pendingWho = who
+        renderCard {
+            title("$who \u2014 kitni der ke liye?")
+            for ((label, ms) in TIMER_OPTIONS) {
+                oneButton(label) { onTimerPicked(who, label, ms) }
+            }
+            oneButton("\u2190 Wapas") { showAskOverlay() }
+        }
+    }
+
+    private fun onTimerPicked(who: String, label: String, millis: Long) {
+        snoozeUntil = System.currentTimeMillis() + millis
+        removeOverlay()
+        Toast.makeText(applicationContext, "$who: $label tak alert band", Toast.LENGTH_SHORT).show()
+    }
+
+    // ---------- overlay building blocks ----------
+
+    /** Poori screen ke peeche dim/blur layer — ye touch intercept nahi karta,
+     *  sirf neeche ka content chhupata hai. */
+    private fun showDim() {
+        if (dimView != null) return
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val blurOk = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && wm.isCrossWindowBlurEnabled
+        val v = View(this)
+        v.setBackgroundColor(if (blurOk) Color.argb(90, 0, 0, 0) else Color.argb(235, 10, 10, 10))
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        if (blurOk) {
+            lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+            lp.blurBehindRadius = 90
+        }
+        try {
+            wm.addView(v, lp)
+            dimView = v
+        } catch (e: Exception) {
+            // ignore
+        }
+    }
+
+    private fun removeDim() {
+        val v = dimView ?: return
+        dimView = null
         try {
             (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(v)
         } catch (e: Exception) {
             // ignore
+        }
+    }
+
+    /** Card ko dobara banata hai (ya pehli baar banata hai) aur builder lambda
+     *  se andar ke views bharta hai. */
+    private fun renderCard(builder: CardBuilder.() -> Unit) {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        var box = cardView
+        if (box == null) {
+            box = LinearLayout(this)
+            box.orientation = LinearLayout.VERTICAL
+            val d = resources.displayMetrics.density
+            box.setPadding((18 * d).toInt(), (16 * d).toInt(), (18 * d).toInt(), (16 * d).toInt())
+            val bg = GradientDrawable()
+            bg.setColor(Color.parseColor("#F2B3001B"))
+            bg.cornerRadius = (18 * d)
+            box.background = bg
+
+            val lp = WindowManager.LayoutParams(
+                (resources.displayMetrics.widthPixels * 0.92f).toInt(),
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            lp.y = (70 * d).toInt()
+            try {
+                wm.addView(box, lp)
+                cardView = box
+            } catch (e: Exception) {
+                return
+            }
+        }
+        box.removeAllViews()
+        CardBuilder(this, box).apply(builder)
+    }
+
+    private fun removeOverlay() {
+        pendingWho = null
+        removeDim()
+        val v = cardView ?: return
+        cardView = null
+        try {
+            (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(v)
+        } catch (e: Exception) {
+            // ignore
+        }
+    }
+
+    /** Chhota helper jo card ke andar text aur buttons add karta hai. */
+    private class CardBuilder(private val ctx: Context, private val root: LinearLayout) {
+        private fun dp(v: Int) = (v * ctx.resources.displayMetrics.density).toInt()
+
+        fun title(text: String) {
+            val tv = TextView(ctx)
+            tv.text = text
+            tv.setTextColor(Color.WHITE)
+            tv.textSize = 20f
+            tv.setTypeface(tv.typeface, android.graphics.Typeface.BOLD)
+            root.addView(tv)
+        }
+
+        fun message(text: String) {
+            val tv = TextView(ctx)
+            tv.text = text
+            tv.setTextColor(Color.WHITE)
+            tv.textSize = 14f
+            tv.setPadding(0, dp(6), 0, dp(12))
+            root.addView(tv)
+        }
+
+        fun twoButtons(label1: String, onClick1: () -> Unit, label2: String, onClick2: () -> Unit) {
+            val row = LinearLayout(ctx)
+            row.orientation = LinearLayout.HORIZONTAL
+            val lpBtn = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            lpBtn.setMargins(dp(4), 0, dp(4), 0)
+            val b1 = Button(ctx).apply { text = label1; setOnClickListener { onClick1() } }
+            val b2 = Button(ctx).apply { text = label2; setOnClickListener { onClick2() } }
+            row.addView(b1, lpBtn)
+            row.addView(b2, lpBtn)
+            root.addView(row)
+        }
+
+        fun oneButton(label: String, onClick: () -> Unit) {
+            val b = Button(ctx)
+            b.text = label
+            b.setOnClickListener { onClick() }
+            root.addView(b, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.topMargin = dp(6) })
         }
     }
 
